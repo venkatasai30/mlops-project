@@ -4,24 +4,43 @@ import argparse
 from datetime import datetime
 
 import mlflow
-import seaborn as sns
-import plotly.express as px
-import matplotlib.pyplot as plt
 from prefect import flow, task, get_run_logger
 from sklearn.impute import SimpleImputer
-from mlflow.entities import ViewType
-from mlflow.tracking import MlflowClient
 from prefect.context import get_run_context
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.pipeline import make_pipeline
-from category_encoders import OneHotEncoder
+from sklearn.base import BaseEstimator, TransformerMixin
+
+
+class ToRecords(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        try:
+            import pandas as pd
+        except Exception:
+            pd = None
+        # Pandas DataFrame → list of dicts
+        if pd is not None and isinstance(X, pd.DataFrame):
+            return X.to_dict(orient="records")
+        # Pandas Series → DataFrame → list of dicts
+        if pd is not None and isinstance(X, pd.Series):
+            return X.to_frame().to_dict(orient="records")
+        # Already a list of dicts
+        if isinstance(X, list) and (len(X) == 0 or isinstance(X[0], dict)):
+            return X
+        # Fallback: wrap single dict
+        if isinstance(X, dict):
+            return [X]
+        raise TypeError(f"Unsupported input type for ToRecords: {type(X)}")
 from prefect.task_runners import SequentialTaskRunner
-from sklearn.linear_model import Ridge, LinearRegression
-from sklearn.model_selection import GridSearchCV, cross_val_score, train_test_split
+from sklearn.linear_model import Ridge
 from sklearn.feature_extraction import DictVectorizer
 
 from utils.prepare import process_data
+from utils.drift import compute_baseline, save_json
 
 
 @task(name="Run models")
@@ -31,16 +50,29 @@ def run_models(X_train, y_train, X_valid, y_valid):
 
             # Build and Train model
             model = make_pipeline(
+                # Ensure DataFrame inputs work with pyfunc/HTTP by converting rows to dicts
+                ToRecords(),
                 DictVectorizer(),
                 SimpleImputer(),
                 model_class(random_state=42),
             )
-            model.fit(X_train.to_dict(orient="records"), y_train)
+            # Pass DataFrames; the pipeline converts rows to dicts internally
+            model.fit(X_train, y_train)
+
+            # Also attach baseline artifact to this model run for downstream drift checks
+            try:
+                baseline = compute_baseline(X_train)
+                os.makedirs("artifacts", exist_ok=True)
+                baseline_path = os.path.join("artifacts", "baseline.json")
+                save_json(baseline_path, baseline)
+                mlflow.log_artifact(baseline_path, artifact_path="baseline")
+            except Exception:
+                pass
 
             # MLflow logging
             start_time = time.time()
-            y_pred_train = model.predict(X_train.to_dict(orient="records"))
-            y_pred_valid = model.predict(X_valid.to_dict(orient="records"))
+            y_pred_train = model.predict(X_train)
+            y_pred_valid = model.predict(X_valid)
             inference_time = time.time() - start_time
 
             mae_train = mean_absolute_error(y_train, y_pred_train)
@@ -65,9 +97,17 @@ def run_models(X_train, y_train, X_valid, y_valid):
 def main(train_file, valid_file):
     # Set and run experiment
     ctx = get_run_context()
-    MLFLOW_TRACKING_URI = "http://127.0.0.1:5000"
-    EXPERIMENT_NAME = (
-        f"citibikes-experiment-{ctx.flow_run.expected_start_time.strftime('%Y-%m-%d')}"
+    # Allow overriding tracking server via env var
+    MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+    # Allow overriding experiment name; default to date-stamped name
+    default_date = None
+    try:
+        default_date = ctx.flow_run.expected_start_time.strftime("%Y-%m-%d")
+    except Exception:
+        default_date = datetime.utcnow().strftime("%Y-%m-%d")
+    EXPERIMENT_NAME = os.getenv(
+        "MLFLOW_EXPERIMENT_NAME",
+        f"citibikes-experiment-{default_date}",
     )
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
@@ -75,6 +115,8 @@ def main(train_file, valid_file):
     mlflow.sklearn.autolog()
 
     logger = get_run_logger()
+    logger.info(f"MLflow tracking URI: {MLFLOW_TRACKING_URI}")
+    logger.info(f"MLflow experiment: {EXPERIMENT_NAME}")
     logger.info("Process data features for model training and validation")
     X_train, y_train, X_valid, y_valid = process_data(train_file, valid_file)
     logger.info(
@@ -83,6 +125,15 @@ def main(train_file, valid_file):
 
     # Run models
     logger.info("Training models")
+    # Log baseline distribution as an artifact for drift checks
+    try:
+        baseline = compute_baseline(X_train)
+        os.makedirs("artifacts", exist_ok=True)
+        baseline_path = os.path.join("artifacts", "baseline.json")
+        save_json(baseline_path, baseline)
+        mlflow.log_artifact(baseline_path, artifact_path="baseline")
+    except Exception as e:
+        logger.warning(f"Failed to compute/log baseline distribution: {e}")
     run_models(X_train, y_train, X_valid, y_valid)
 
 

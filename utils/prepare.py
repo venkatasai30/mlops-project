@@ -20,6 +20,8 @@ def download_files(files):
             logger.info(f"File path: {path}/{file} already exists")
         else:
             logger.info("Downloading training and validation datasets")
+            # Ensure destination directory exists
+            os.makedirs(path, exist_ok=True)
             url = f"https://s3.amazonaws.com/capitalbikeshare-data/{file}"
             resp = requests.get(url, stream=True)
             save_path = f"{path}/{file}"

@@ -14,6 +14,9 @@ def stage_model(tracking_uri, experiment_name):
     """Register and stage best model."""
     logger = get_run_logger()
 
+    # Point MLflow to the tracking server
+    mlflow.set_tracking_uri(tracking_uri)
+
     # Get best model from current experiment
     logger.info("Getting best model from current experiment")
     client = MlflowClient(tracking_uri=tracking_uri)
@@ -30,21 +33,26 @@ def stage_model(tracking_uri, experiment_name):
     best_model = candidates[0]
     experiment_id = best_model.info.experiment_id
     run_id = best_model.info.run_id
+    name = f"CITIBIKESDurationModel-{run_id}"
     try:
         registered_model = mlflow.register_model(
-            model_uri=f"runs:/{best_model.info.run_id}/model",
-            name=f"CITIBIKESDurationModel-{run_id}",
+            model_uri=f"runs:/{run_id}/model",
+            name=name,
         )
     except Exception:
-        client.create_registered_model(f"CITIBIKESDurationModel-{run_id}")
+        # Fallback for cases where register_model fails (e.g. race/dup)
+        try:
+            client.create_registered_model(name)
+        except Exception:
+            pass
         registered_model = client.create_model_version(
-            name=f"CITIBIKESDurationModel-{run_id}",
-            source=f"s3://mlflow-models-artifact-store-cmd/{experiment_id}/{run_id}/artifacts/model",
+            name=name,
+            source=f"runs:/{run_id}/model",
             run_id=run_id,
         )
 
     client.transition_model_version_stage(
-        name=f"CITIBIKESDurationModel-{run_id}",
+        name=name,
         version=registered_model.version,
         stage="Staging",
     )
@@ -52,7 +60,7 @@ def stage_model(tracking_uri, experiment_name):
     # Update description of staged model
     logger.info("Updating description of staged model")
     client.update_model_version(
-        name=f"CITIBIKESDurationModel-{run_id}",
+        name=name,
         version=registered_model.version,
         description=f"[{datetime.now()}] The model version {registered_model.version} from experiment '{experiment_name}' was transitioned to Staging.",
     )
